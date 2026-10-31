@@ -1,4 +1,4 @@
-:  APK Builder
+name: Universal APK Builder
 
 # Upload a project .zip into the incoming/ folder -> APK appears under Releases.
 on:
@@ -40,7 +40,7 @@ jobs:
           ROOT=work
           # descend while there is exactly one folder and no files
           while [ "$(ls -A "$ROOT" | wc -l)" = "1" ] && [ -d "$ROOT/$(ls -A "$ROOT")" ]; do
-            ROOT="$ROOT/$(ls -A "$ROOT")"
+            ROOT="$ROOT/$(ls -A "$name: Universal APK Builder")"
           done
           cd "$ROOT"
           if   [ -f pubspec.yaml ]; then KIND=flutter
