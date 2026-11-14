@@ -9,10 +9,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: apk-builder-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -34,7 +30,7 @@ jobs:
       - name: Unzip and detect project type
         id: detect
         run: |
-          set -euo pipefail
+          set -e
           CHANGED=$(git diff --name-only HEAD~1 HEAD -- 'incoming/*.zip' 2>/dev/null | head -1 || true)
           ZIP="${CHANGED:-$(ls incoming/*.zip 2>/dev/null | tail -1)}"
           [ -z "$ZIP" ] && { echo "No zip found in incoming/"; exit 1; }
@@ -67,46 +63,19 @@ jobs:
           channel: stable
           cache: true
 
-      # gradle-version "current" only provisions a fallback `gradle` binary used to
-      # BOOTSTRAP a missing/broken wrapper (see gw() below). It never overrides a
-      # project's own gradlew, which always honours its own gradle-wrapper.properties.
-      # Pinning an old fixed version here was the root cause of the original failure:
-      # projects with no wrapper silently built against a stale global Gradle instead
-      # of the version the project actually required.
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: current
+          gradle-version: '8.10.2'
 
       - name: Build APK
         working-directory: ${{ steps.detect.outputs.root }}
         run: |
-          set -euo pipefail
-
-          # Ensures a working ./gradlew exists and is used for every Gradle-based build
-          # path, so the project's own declared/implied Gradle version is always what
-          # actually runs - never a bare global `gradle` invocation.
-          ensure_wrapper() {
-            if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
-              return
-            fi
-            echo "Gradle wrapper missing or incomplete - regenerating it."
-            if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
-              DIST_URL=$(grep '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties | cut -d= -f2- | sed 's/\\:/:/g')
-              echo "Rebuilding wrapper from declared distribution: $DIST_URL"
-              gradle wrapper --gradle-distribution-url "$DIST_URL" --no-daemon
-            else
-              echo "No gradle-wrapper.properties found - bootstrapping with current stable Gradle."
-              gradle wrapper --gradle-version current --no-daemon
-            fi
-          }
-
+          set -e
           gw() {
-            ensure_wrapper
-            chmod +x gradlew
-            ./gradlew assembleDebug --no-daemon --stacktrace
+            if [ -f gradlew ]; then chmod +x gradlew && ./gradlew assembleDebug --no-daemon
+            else gradle assembleDebug --no-daemon; fi
           }
-
           case "${{ steps.detect.outputs.kind }}" in
             flutter)
               flutter pub get
@@ -135,7 +104,6 @@ jobs:
 
       - name: Collect APK
         run: |
-          set -euo pipefail
           APK=$(find "${{ steps.detect.outputs.root }}" -name '*.apk' -path '*debug*' | head -1)
           [ -z "$APK" ] && APK=$(find "${{ steps.detect.outputs.root }}" -name '*.apk' | head -1)
           [ -z "$APK" ] && { echo "No APK produced"; exit 1; }
@@ -152,8 +120,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
           gh release create "build-${{ github.run_number }}" apk-out/*.apk \
             --title "APK build ${{ github.run_number }}" \
-            --notes "Type: ${{ steps.detect.outputs.kind }}" \
-            --clobber
+            --notes "Type: ${{ steps.detect.outputs.kind }}"
