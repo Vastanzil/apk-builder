@@ -1,0 +1,208 @@
+name: Universal APK Builder
+
+# Upload a project .zip into the incoming/ folder -> APK appears under Releases.
+on:
+  push:
+    paths: ['incoming/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # Install several JDKs; the right one is chosen later per project.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            11
+            21
+            17
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Unzip and detect project type
+        id: detect
+        run: |
+          set -e
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- 'incoming/*.zip' 2>/dev/null | head -1 || true)
+          if [ -n "$CHANGED" ] && [ -f "$CHANGED" ]; then ZIP="$CHANGED"
+          else ZIP=$(ls -t incoming/*.zip 2>/dev/null | head -1); fi
+          [ -z "$ZIP" ] && { echo "No zip found in incoming/"; exit 1; }
+          echo "Using $ZIP"
+          rm -rf work && mkdir work
+          unzip -q "$ZIP" -d work
+          rm -rf work/__MACOSX
+          echo "Zip contents (top levels):"
+          find work -maxdepth 2 | head -30
+
+          MARK=$(find work -maxdepth 5 \( -name pubspec.yaml -o -name 'capacitor.config.*' -o -name gradlew -o -name 'settings.gradle*' -o -name package.json -o -name config.xml \) -not -path '*/node_modules/*' | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+          [ -z "$MARK" ] && { echo "No Android/Flutter/RN/Cordova project files found in zip"; exit 1; }
+          ROOT=$(dirname "$MARK")
+          ROOT=$(cd "$ROOT" && pwd)
+          cd "$ROOT"
+
+          if   [ -f pubspec.yaml ]; then KIND=flutter
+          elif ls capacitor.config.* >/dev/null 2>&1; then KIND=capacitor
+          elif [ -f config.xml ] && grep -q cordova config.xml; then KIND=cordova
+          elif [ -f package.json ] && grep -q '"expo"' package.json; then KIND=expo
+          elif [ -f package.json ] && grep -q 'react-native' package.json; then KIND=rn
+          elif ls settings.gradle* build.gradle* >/dev/null 2>&1 || [ -f gradlew ]; then KIND=gradle
+          else echo "Could not detect project type"; ls -la; exit 1
+          fi
+          echo "Detected: $KIND"
+
+          # Does a Gradle wrapper exist (root or android/)?
+          WRAPPER=no
+          [ -f gradlew ] && WRAPPER=yes
+          [ -f android/gradlew ] && WRAPPER=yes
+
+          # Pick JDK from the wrapper's Gradle version (default 17).
+          JV=17
+          WP=$(ls gradle/wrapper/gradle-wrapper.properties android/gradle/wrapper/gradle-wrapper.properties 2>/dev/null | head -1 || true)
+          if [ -n "$WP" ]; then
+            GV=$(grep -oE 'gradle-[0-9]+\.[0-9]+' "$WP" | head -1 | sed 's/gradle-//')
+            MAJ=${GV%%.*}; MIN=${GV#*.}
+            echo "Wrapper Gradle version: $GV"
+            if [ "$MAJ" -lt 7 ] || { [ "$MAJ" -eq 7 ] && [ "$MIN" -lt 3 ]; }; then JV=11; fi
+            # Gradle 9+ needs JDK 17 or newer to run; 21 is the safe pick
+            if [ "$MAJ" -ge 9 ]; then JV=21; fi
+          fi
+          echo "Using JDK $JV"
+
+          {
+            echo "root=$ROOT"
+            echo "kind=$KIND"
+            echo "wrapper=$WRAPPER"
+            echo "jdk=$JV"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Select JDK
+        run: |
+          case "${{ steps.detect.outputs.jdk }}" in
+            11) P="$JAVA_HOME_11_X64" ;;
+            21) P="$JAVA_HOME_21_X64" ;;
+            *)  P="$JAVA_HOME_17_X64" ;;
+          esac
+          echo "JAVA_HOME=$P" >> "$GITHUB_ENV"
+          echo "$P/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Flutter
+        if: steps.detect.outputs.kind == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Only install Gradle ourselves when the project has no wrapper.
+      - name: Setup Gradle (no wrapper in project)
+        if: steps.detect.outputs.wrapper == 'no'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: current
+
+      - name: Setup Gradle caching (wrapper projects)
+        if: steps.detect.outputs.wrapper == 'yes'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK (34 + whatever the project needs)
+        run: |
+          SDKM=$(command -v sdkmanager || ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1 || true)
+          if [ -z "$SDKM" ]; then echo "sdkmanager not found, relying on Gradle auto-download"; exit 0; fi
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+
+          # API levels: always 34, plus any compileSdk/targetSdk found in the project
+          LEVELS=$( { echo 34; grep -rhoE '(compileSdk|compileSdkVersion|targetSdk|targetSdkVersion)[ =(]+[0-9]+' "${{ steps.detect.outputs.root }}" \
+            --include=build.gradle --include=build.gradle.kts --include=variables.gradle 2>/dev/null | grep -oE '[0-9]+$'; } | sort -nu)
+          echo "Installing API levels: $LEVELS"
+          for L in $LEVELS; do
+            [ "$L" -ge 21 ] 2>/dev/null || continue
+            yes | "$SDKM" "platforms;android-$L" >/dev/null 2>&1 || echo "platform $L unavailable"
+          done
+          yes | "$SDKM" "build-tools;34.0.0" "platform-tools" >/dev/null 2>&1 || true
+          "$SDKM" --list_installed 2>/dev/null | head -20 || true
+
+      - name: Build APK
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          LOG="$GITHUB_WORKSPACE/logs/build.log"
+          gw() {
+            if [ -f gradlew ]; then chmod +x gradlew && ./gradlew assembleDebug --no-daemon --stacktrace
+            else gradle assembleDebug --no-daemon --stacktrace; fi
+          }
+          case "${{ steps.detect.outputs.kind }}" in
+            flutter)
+              flutter pub get
+              flutter build apk --debug ;;
+            capacitor)
+              if [ -f package-lock.json ]; then npm ci || npm install; else npm install; fi
+              npm run build --if-present
+              [ -d android ] || npx cap add android
+              npx cap sync android
+              cd android && gw ;;
+            cordova)
+              npm install -g cordova
+              [ -f package.json ] && npm install || true
+              cordova platform add android || true
+              cordova build android ;;
+            expo)
+              npm install
+              npx expo prebuild --platform android --no-install
+              cd android && gw ;;
+            rn)
+              npm install
+              cd android && gw ;;
+            gradle)
+              gw ;;
+          esac 2>&1 | tee "$LOG"
+
+      - name: Show compile errors
+        if: failure()
+        run: |
+          echo "### Build errors" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^e: |error:|FAILURE|What went wrong' -A2 logs/build.log 2>/dev/null | head -60 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: logs/
+          if-no-files-found: ignore
+
+      - name: Collect APK
+        run: |
+          ROOT="${{ steps.detect.outputs.root }}"
+          APK=$(find "$ROOT" -name '*.apk' -path '*debug*' -not -path '*/node_modules/*' | head -1)
+          [ -z "$APK" ] && APK=$(find "$ROOT" -name '*.apk' -not -path '*/node_modules/*' | head -1)
+          [ -z "$APK" ] && { echo "No APK produced"; exit 1; }
+          mkdir -p apk-out
+          cp "$APK" apk-out/app-${{ github.run_number }}.apk
+          ls -lh apk-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: apk-out/*.apk
+
+      - name: Publish Release (easy phone download)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}-${{ github.run_attempt }}" apk-out/*.apk \
+            --title "APK build ${{ github.run_number }}" \
+            --notes "Type: ${{ steps.detect.outputs.kind }} | JDK ${{ steps.detect.outputs.jdk }}"
